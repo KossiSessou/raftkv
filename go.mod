@@ -1,3 +1,3 @@
-module github.com/KossiSessou/dissys
+module github.com/KossiSessou/raftkv
 
 go 1.24

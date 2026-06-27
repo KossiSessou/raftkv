@@ -43,7 +43,7 @@ The full on-disk format and the rationale behind each field is documented in [`d
 ```
 .
 ├── cmd/
-│   └── dissys/       # main entry point (placeholder for now)
+│   └── raftkv/       # main entry point (placeholder for now)
 ├── internal/
 │   ├── kv/           # Store interface + MutexStore / ShardedStore
 │   └── wal/          # write-ahead log package
