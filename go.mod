@@ -1,3 +1,3 @@
-module github.com/KossiSessou/wal
+module github.com/KossiSessou/dissys
 
 go 1.24
