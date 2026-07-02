@@ -13,6 +13,8 @@ import (
 type SyncMode int
 
 const defaultMaxSegmentSize = 64 << 20
+const maxRecordSize = 1 << 30
+const defaultSyncInterval = 100 * time.Millisecond
 
 const (
 	SyncNever SyncMode = iota
@@ -33,7 +35,6 @@ type WAL struct {
 	fd        *os.File
 	mu        sync.Mutex
 	mode      SyncMode
-	interval  time.Duration
 	maxSize   uint64
 	activeID  uint64
 	position  uint64
@@ -50,7 +51,7 @@ type Config struct {
 }
 
 func Open(dir string, cfg Config) (*WAL, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
 
@@ -64,12 +65,15 @@ func Open(dir string, cfg Config) (*WAL, error) {
 	if maxSize == 0 {
 		maxSize = defaultMaxSegmentSize
 	}
+
+	if cfg.Mode == SyncInterval && cfg.Interval <= 0 {
+		cfg.Interval = defaultSyncInterval
+	}
 	w := &WAL{
-		dir:      dir,
-		mode:     cfg.Mode,
-		interval: cfg.Interval,
-		maxSize:  maxSize,
-		done:     make(chan struct{}),
+		dir:     dir,
+		mode:    cfg.Mode,
+		maxSize: maxSize,
+		done:    make(chan struct{}),
 	}
 	if len(ids) == 0 {
 		w.activeID = 1
@@ -102,19 +106,46 @@ func Open(dir string, cfg Config) (*WAL, error) {
 	return w, nil
 }
 
+func (w *WAL) closeLocked() error {
+
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+
+	var firstErr error
+
+	if err := w.fd.Sync(); err != nil {
+		firstErr = err
+	}
+
+	close(w.done)
+
+	// If there IS a goroutine, wait for it to exit. We must drop the lock
+	// during the wait, because the goroutine is trying to acquire this
+	// same lock inside its w.Sync() call. Holding it would deadlock.
+	// Safety: w.closed is already true, so any Append that grabs the lock
+	// in the gap will short-circuit with ErrClosed and do nothing.
+	if w.mode == SyncInterval {
+		w.mu.Unlock()
+		<-w.stopped
+		w.mu.Lock()
+	}
+
+	if err := w.fd.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+
+	return firstErr
+
+}
+
 func (w *WAL) Close() error {
 	var err error
 	w.closeOnce.Do(func() {
 		w.mu.Lock()
-		w.closed = true
-		_ = w.fd.Sync()
+		err = w.closeLocked()
 		w.mu.Unlock()
-
-		close(w.done)
-		if w.mode == SyncInterval {
-			<-w.stopped
-		}
-		err = w.fd.Close()
 	})
 
 	return err
@@ -146,22 +177,33 @@ func (w *WAL) syncLoop(ticker *time.Ticker) {
 
 func (w *WAL) rotate() (err error) {
 	if err = w.fd.Sync(); err != nil {
+		_ = w.closeLocked()
 		return err
 	}
-	if err = w.fd.Close(); err != nil {
-		return err
-	}
-	w.activeID += 1
 
-	path := formatSegmentName(w.activeID)
-
-	w.fd, err = os.OpenFile(filepath.Join(w.dir, path), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	fi, err := os.OpenFile(filepath.Join(w.dir, formatSegmentName(w.activeID+1)), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
+		_ = w.closeLocked()
 		return err
 	}
 
-	w.position = 0
+	committed := false
 
+	defer func() {
+		if !committed {
+			_ = fi.Close()
+		}
+	}()
+
+	if err = w.fd.Close(); err != nil {
+		_ = w.closeLocked()
+		return err
+	}
+
+	w.fd = fi
+	w.activeID++
+	w.position = 0
+	committed = true
 	return nil
 
 }
@@ -177,7 +219,7 @@ func (w *WAL) Append(record []byte) (offset Offset, err error) {
 
 	recordLen := len(record)
 
-	if uint64(8+recordLen) > w.maxSize {
+	if 8+recordLen > maxRecordSize {
 		return Offset{}, ErrRecordTooLarge
 
 	}
@@ -205,6 +247,7 @@ func (w *WAL) Append(record []byte) (offset Offset, err error) {
 	for written < len(buf) {
 		n, err := w.fd.Write(buf[written:])
 		if err != nil {
+			_ = w.closeLocked()
 			return Offset{}, err
 		}
 		written += n
@@ -216,7 +259,8 @@ func (w *WAL) Append(record []byte) (offset Offset, err error) {
 
 	if w.mode == SyncAlways {
 		if err := w.fd.Sync(); err != nil {
-			return offset, err
+			_ = w.closeLocked()
+			return Offset{}, err
 		}
 	}
 

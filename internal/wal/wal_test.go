@@ -86,6 +86,61 @@ func TestOpenResumesActiveSegment(t *testing.T) {
 	_ = w.Close()
 }
 
+func TestOpenResumesActiveSegmentPosition(t *testing.T) {
+	dir := t.TempDir()
+
+	w1, err := Open(dir, Config{Mode: SyncNever})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	off1, err := w1.Append([]byte("Hello"))
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = w1.Append([]byte("World"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = w1.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	segmentPath := filepath.Join(dir, formatSegmentName(1))
+
+	info, err := os.Stat(segmentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedResumePosition := uint64(info.Size())
+
+	w2, err := Open(dir, Config{Mode: SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	off2, err := w2.Append([]byte("Resumed"))
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if off2.Position == off1.Position {
+		t.Errorf("new append after reopen collided with existing record at position %d", off2.Position)
+	}
+
+	if off2.Position != expectedResumePosition {
+		t.Errorf("new append after reopen at Position=%d; want %d (post-reopen EOF)",
+			off2.Position, expectedResumePosition)
+	}
+}
+
 func TestRotation(t *testing.T) {
 	dir := t.TempDir()
 	w, _ := Open(dir, Config{Mode: SyncNever, MaxSize: 40})
