@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,9 +13,11 @@ import (
 
 type SyncMode int
 
-const defaultMaxSegmentSize = 64 << 20
-const maxRecordSize = 1 << 30
-const defaultSyncInterval = 100 * time.Millisecond
+const (
+	defaultMaxSegmentSize = 64 << 20
+	maxRecordSize         = 1 << 30
+	defaultSyncInterval   = 100 * time.Millisecond
+)
 
 const (
 	SyncNever SyncMode = iota
@@ -22,12 +25,21 @@ const (
 	SyncInterval
 )
 
-var ErrClosed = errors.New("wal closed")
-var ErrRecordTooLarge = errors.New("record too large")
+var (
+	ErrClosed         = errors.New("wal: file closed")
+	ErrRecordTooLarge = errors.New("wal: record too large")
+	ErrCRCMismatch    = errors.New("wal: CRC mismatch")
+	ErrCorrupt        = errors.New("wal: torn file")
+)
 
 type Offset struct {
 	SegmentID uint64
 	Position  uint64
+}
+
+type readResult struct {
+	record []byte
+	size   uint64
 }
 
 type WAL struct {
@@ -50,8 +62,21 @@ type Config struct {
 	MaxSize  uint64
 }
 
+type Iterator struct {
+	dir       string
+	segID     uint64
+	fd        *os.File
+	pos       uint64
+	activeID  uint64
+	record    []byte
+	off       Offset
+	err       error
+	lastValid Offset
+	done      bool
+}
+
 func Open(dir string, cfg Config) (*WAL, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 
@@ -88,13 +113,28 @@ func Open(dir string, cfg Config) (*WAL, error) {
 		return nil, err
 	}
 
-	info, err := fi.Stat()
+	it, err := w.Replay(Offset{SegmentID: w.activeID, Position: 0})
+
 	if err != nil {
-		_ = fi.Close()
 		return nil, err
 	}
+
+	for it.Next() {
+
+	}
+
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+
+	boundary := it.LastValid().Position
+
 	w.fd = fi
-	w.position = uint64(info.Size())
+	w.position = boundary
+
+	if err := w.fd.Truncate(int64(boundary)); err != nil {
+		return nil, err
+	}
 
 	if cfg.Mode == SyncInterval {
 
@@ -107,7 +147,6 @@ func Open(dir string, cfg Config) (*WAL, error) {
 }
 
 func (w *WAL) closeLocked() error {
-
 	if w.closed {
 		return nil
 	}
@@ -137,7 +176,6 @@ func (w *WAL) closeLocked() error {
 	}
 
 	return firstErr
-
 }
 
 func (w *WAL) Close() error {
@@ -181,7 +219,7 @@ func (w *WAL) rotate() (err error) {
 		return err
 	}
 
-	fi, err := os.OpenFile(filepath.Join(w.dir, formatSegmentName(w.activeID+1)), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	fi, err := os.OpenFile(filepath.Join(w.dir, formatSegmentName(w.activeID+1)), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		_ = w.closeLocked()
 		return err
@@ -205,11 +243,9 @@ func (w *WAL) rotate() (err error) {
 	w.position = 0
 	committed = true
 	return nil
-
 }
 
 func (w *WAL) Append(record []byte) (offset Offset, err error) {
-
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -221,7 +257,6 @@ func (w *WAL) Append(record []byte) (offset Offset, err error) {
 
 	if 8+recordLen > maxRecordSize {
 		return Offset{}, ErrRecordTooLarge
-
 	}
 
 	buf := make([]byte, 8+recordLen)
@@ -265,4 +300,186 @@ func (w *WAL) Append(record []byte) (offset Offset, err error) {
 	}
 
 	return offset, nil
+}
+
+func (w *WAL) Replay(from Offset) (*Iterator, error) {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return nil, ErrClosed
+
+	}
+	activeID := w.activeID
+	w.mu.Unlock()
+
+	fi, err := os.OpenFile(filepath.Join(w.dir, formatSegmentName(from.SegmentID)), os.O_RDONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Iterator{
+		dir:      w.dir,
+		activeID: activeID,
+		segID:    from.SegmentID,
+		fd:       fi,
+		pos:      from.Position,
+	}, nil
+
+}
+
+func readRecordAt(f *os.File, pos uint64) (readResult, error) {
+	header := make([]byte, 8)
+
+	n, err := f.ReadAt(header, int64(pos))
+
+	if n == 0 && err == io.EOF {
+		return readResult{}, io.EOF
+	}
+	if err != nil && err != io.EOF {
+		return readResult{}, err
+	}
+
+	if n < len(header) {
+		return readResult{}, ErrCorrupt
+	}
+
+	length := binary.LittleEndian.Uint32(header[0:4])
+
+	if length == 0 {
+		return readResult{}, io.EOF
+	}
+
+	storedCrc := binary.LittleEndian.Uint32(header[4:8])
+	payload := make([]byte, length)
+
+	n, err = f.ReadAt(payload, int64(pos+8))
+
+	if err != nil && err != io.EOF {
+		return readResult{}, err
+	}
+
+	if n < len(payload) {
+		return readResult{}, ErrCorrupt
+	}
+
+	crc := crc32.Update(0, crc32.IEEETable, header[0:4])
+	crc = crc32.Update(crc, crc32.IEEETable, payload)
+
+	if crc != storedCrc {
+		return readResult{}, ErrCRCMismatch
+	}
+
+	return readResult{record: payload, size: uint64(8 + length)}, nil
+}
+
+func (it *Iterator) Next() bool {
+	//   1. if done → return false
+	if it.done {
+		return false
+	}
+
+	for {
+		//   2. res, err := readRecordAt(fd, pos)
+		res, err := readRecordAt(it.fd, it.pos)
+
+		//   3. switch on err:
+		switch err {
+		//nil (good record):
+		case nil:
+
+			//  - store res.record and the offset {segID, pos} for accessors
+			it.record = res.record
+			it.off = Offset{SegmentID: it.segID, Position: it.pos}
+
+			//         - advance pos += res.size
+			it.pos += res.size
+			//         - return true
+
+			return true
+
+		//
+		//io.EOF (clean end of this segment):
+		case io.EOF:
+
+			it.lastValid = Offset{SegmentID: it.segID, Position: it.pos}
+			//  - close current fd
+			_ = it.fd.Close()
+			it.fd = nil
+			//         - try to open segment segID+1 for reading
+			fi, err := os.OpenFile(filepath.Join(it.dir, formatSegmentName(it.segID+1)), os.O_RDONLY, 0644)
+
+			//           - doesn't exist (os.IsNotExist) → done = true, return false (no error, clean end of log)
+
+			if os.IsNotExist(err) {
+				it.done = true
+
+				return false
+			}
+			//           - other open error → set err, done, return false
+			if err != nil {
+				it.err = err
+				it.done = true
+				return false
+			}
+			//	- opened successfully → set fd, segID++, pos = 0, LOOP back to step 2
+			it.fd = fi
+			it.segID++
+			it.pos = 0
+			continue
+
+		// damage (ErrCorrupt / ErrCRCMismatch):
+		case ErrCRCMismatch, ErrCorrupt:
+			it.done = true
+			//		- is this the active segment? (segID == activeID)
+			if it.segID != it.activeID {
+				//		- NO  → sealed-segment corruption. done = true.
+				//                   err = ErrCorrupt (hard error, recovery must refuse).
+				//                   return false.
+				it.err = ErrCorrupt
+				_ = it.fd.Close()
+				it.fd = nil
+				return false
+
+			}
+			//		- YES → torn tail. done = true. Record the truncation boundary
+			//                   (= current pos, the start of the bad record = end of last good).
+			//                   err stays nil (this is normal recovery, not failure).
+			//                   return false.
+
+			//
+			it.lastValid = Offset{SegmentID: it.segID, Position: it.pos}
+			_ = it.fd.Close()
+			it.fd = nil
+			return false
+			//
+
+		default:
+
+			//      other (real I/O error):
+			//         - set err, done, return false
+			it.err = err
+			it.done = true
+			_ = it.fd.Close()
+			it.fd = nil
+			return false
+
+		}
+
+	}
+
+}
+
+func (it *Iterator) Record() []byte    { return it.record }
+func (it *Iterator) Offset() Offset    { return it.off }
+func (it *Iterator) Err() error        { return it.err }
+func (it *Iterator) LastValid() Offset { return it.lastValid }
+func (it *Iterator) Close() error {
+
+	if it.fd == nil {
+		return nil
+	}
+
+	err := it.fd.Close()
+	it.fd = nil
+	return err
 }

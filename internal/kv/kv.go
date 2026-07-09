@@ -12,7 +12,8 @@ type Store interface {
 	Delete(ket string)
 }
 
-// Struct — Go's record type. Field names, then their types.
+// Struct — Go's record type. Field names, then their
+// types.
 type MutexStore struct {
 	data map[string]string
 
