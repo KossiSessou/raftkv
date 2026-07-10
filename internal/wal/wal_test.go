@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -848,6 +851,21 @@ func TestIteratorCloseEarly(t *testing.T) {
 
 }
 
+func TestCrashRecoveryProperty(t *testing.T) {
+	// PROPERTY: recovered records are a PREFIX of acknowledged records.
+	// Note: active-segment corruption truncates at the first bad record, so
+	// acknowledged records AFTER the corruption point in the active segment
+	// are legitimately lost (documented limitation — active-segment mid-corruption
+	// is treated as a torn tail). The prefix property permits this. It does NOT
+	// permit gaps, reorders, altered records, or extra records.
+	for iter := 0; iter < 200; iter++ {
+		seed := time.Now().UnixNano() + int64(iter)
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			runCrashScenario(t, seed)
+		})
+	}
+}
+
 // makeRecord builds a framed record (length + crc + payload) the same way
 // Append does — a test helper so corrupt-file construction stays readable.
 func makeRecord(t *testing.T, payload []byte) []byte {
@@ -877,4 +895,192 @@ func drainReplay(t *testing.T, it *Iterator) ([][]byte, []Offset, error) {
 	}
 
 	return records, offsets, nil
+}
+
+func randomBytes(t *testing.T, rng *rand.Rand) []byte {
+	t.Helper()
+	n := rng.Intn(100) + 1
+	b := make([]byte, n)
+
+	rng.Read(b)
+	return b
+
+}
+
+func runCrashScenario(t *testing.T, seed int64) {
+	t.Helper()
+	rng := rand.New(rand.NewSource(seed))
+	// 1. open a WAL, append a random number of random-sized records,
+	//    remembering exactly which ones Append acknowledged (returned nil).
+	dir := t.TempDir()
+	w, err := Open(dir, Config{Mode: SyncAlways, MaxSize: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var acked [][]byte
+	n := rng.Intn(50) + 1
+
+	for range n {
+		rec := randomBytes(t, rng)
+
+		_, err := w.Append(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		acked = append(acked, rec)
+
+	}
+
+	// 2. close.
+	active := w.activeID
+	_ = w.Close()
+
+	path := filepath.Join(dir, formatSegmentName(active))
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	size := info.Size()
+
+	if size == 0 {
+		t.Skip("empty log — nothing to corrupt")
+	}
+
+	if rng.Intn(2) == 0 {
+		cut := rng.Int63n(size)
+
+		if err := f.Truncate(cut); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		off := rng.Int63n(size)
+
+		var b [1]byte
+
+		if _, err := f.ReadAt(b[:], off); err != nil {
+			t.Fatal(err)
+		}
+
+		b[0] ^= 1 << uint(rng.Intn(8))
+		if _, err := f.WriteAt(b[:], off); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 4. reopen (recovery runs) — or replay directly.
+	w2, err := Open(dir, Config{Mode: SyncAlways, MaxSize: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	it, err := w2.Replay(Offset{1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	records, _, err := drainReplay(t, it)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("seed=%d: %d segments, %d acked, %d recovered", seed, active, len(acked), len(records))
+
+	// 5. PROPERTY: the records that come back must be a PREFIX of the
+	//    acknowledged records. Not a superset, not reordered, not a
+	//    record that differs. A proper prefix (some suffix may be lost).
+	if len(records) > len(acked) {
+		t.Fatalf("seed=%d: got %d records, but only %d were acknowledged",
+			seed, len(records), len(acked))
+	}
+
+	for i := range records {
+		if !bytes.Equal(records[i], acked[i]) {
+			t.Fatalf("seed=%d: record %d mismatch: got %q, want %q",
+				seed, i, records[i], acked[i])
+		}
+	}
+
+	if err := it.Err(); err != nil {
+		t.Fatal(err)
+	}
+	// 6. on failure, the seed is in the subtest name → reproducible.
+}
+
+func BenchmarkAppendSyncNever(b *testing.B)    { benchAppend(b, SyncNever) }
+func BenchmarkAppendSyncInterval(b *testing.B) { benchAppend(b, SyncInterval) }
+func BenchmarkAppendSyncAlways(b *testing.B)   { benchAppend(b, SyncAlways) }
+
+func benchAppend(b *testing.B, mode SyncMode) {
+
+	dir := b.TempDir()
+
+	w, err := Open(dir, Config{Mode: mode, Interval: 10 * time.Millisecond})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	record := make([]byte, 100)
+
+	b.ResetTimer()
+
+	for range b.N {
+		if _, err := w.Append(record); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	_ = w.Close()
+}
+
+func TestAppendLatencyPercentiles(t *testing.T) {
+
+	modes := []struct {
+		name string
+		mode SyncMode
+		n    int
+	}{
+		{"SyncNever", SyncNever, 100000},
+		{"SyncInterval", SyncInterval, 100000},
+		{"SyncAlways", SyncAlways, 2000},
+	}
+
+	record := make([]byte, 100)
+
+	for _, m := range modes {
+		dir := t.TempDir()
+
+		w, err := Open(dir, Config{Mode: m.mode, Interval: 10 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		latencies := make([]time.Duration, m.n)
+
+		for i := 0; i < m.n; i++ {
+			start := time.Now()
+
+			if _, err := w.Append(record); err != nil {
+				t.Fatal(err)
+			}
+
+			latencies[i] = time.Since(start)
+		}
+
+		_ = w.Close()
+
+		slices.Sort(latencies)
+
+		p50 := latencies[m.n*50/100]
+		p99 := latencies[m.n*99/100]
+		p999 := latencies[m.n*999/1000]
+
+		t.Logf("%-13s p50=%-12v p99=%-12v p999=%-12v",
+			m.name, p50, p99, p999)
+
+	}
 }

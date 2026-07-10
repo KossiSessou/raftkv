@@ -66,9 +66,10 @@ The on-disk format and design rationale are documented in
 │   ├── kv/            # Store interface + MutexStore / ShardedStore
 │   └── wal/           # write-ahead log + segment utilities
 ├── docs/
-│   ├── wal-design.md  # WAL runtime behaviour and concurrency contract
-│   ├── wal-format.md  # on-disk binary format specification
-│   └── LIMITATIONS.md # known limitations and design tradeoffs
+│   ├── benchmark.md     # KV store & WAL performance results
+│   ├── wal-design.md    # WAL runtime behaviour and concurrency contract
+│   ├── wal-format.md    # on-disk binary format specification
+│   └── LIMITATIONS.md   # known limitations and design tradeoffs
 └── Makefile
 ```
 
@@ -84,6 +85,20 @@ make bench   # go test -bench=. -benchmem ./...
 
 CI runs `go vet`, `golangci-lint`, and the full test suite **with the race
 detector** on every push and pull request to `main`.
+
+## Benchmarks
+
+Quick summary of key results (Apple M3, Go 1.24, 5 iterations × 3s):
+
+| What | Highlight |
+|------|-----------|
+| KV 8 goroutines, 50/50 R/W | ShardedStore **1.5x** faster than MutexStore |
+| KV 8 goroutines, 10/90 R/W | ShardedStore **2.3x** faster (writes rarely contend) |
+| WAL SyncNever append | ~800K ops/s, p99 latency **4.25 µs** |
+| WAL SyncAlways append | ~362 ops/s, p99 latency **3.38 ms** |
+
+Both KV implementations allocate zero bytes per operation. Full results and analysis:
+[`docs/benchmark.md`](docs/benchmark.md)
 
 ## Next up
 
