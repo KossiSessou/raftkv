@@ -1,0 +1,8 @@
+{"op":"call","kind":"put","key":"x","value":"init","id":0,"time":0}
+{"op":"return","kind":"put","key":"x","value":"init","id":0,"time":50}
+{"op":"call","kind":"put","key":"x","value":"from-client-1","id":1,"time":100}
+{"op":"call","kind":"put","key":"x","value":"from-client-2","id":2,"time":120}
+{"op":"return","kind":"put","key":"x","value":"from-client-2","id":2,"time":180}
+{"op":"call","kind":"get","key":"x","id":3,"time":200}
+{"op":"return","kind":"get","key":"x","value":"init","id":3,"time":250}
+{"op":"return","kind":"put","key":"x","value":"from-client-1","id":1,"time":300}

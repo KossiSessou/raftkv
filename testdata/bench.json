@@ -1,0 +1,31 @@
+{
+  "metadata": {
+    "date": "2026-12-01",
+    "nodes": 3,
+    "hardware": "MacBook Pro M2, 16GB",
+    "etcd_version": "3.5.12"
+  },
+  "workloads": [
+    {
+      "name": "100% writes 100B",
+      "raftkv": {"ops": 12400, "p50": 1.2, "p99": 4.1},
+      "etcd": {"ops": 15200, "p50": 0.9, "p99": 3.8}
+    },
+    {
+      "name": "100% reads 100B",
+      "raftkv": {"ops": 28000, "p50": 0.4, "p99": 1.5},
+      "etcd": {"ops": 35000, "p50": 0.3, "p99": 1.1}
+    },
+    {
+      "name": "50/50 read-write 1KB",
+      "raftkv": {"ops": 8500, "p50": 2.1, "p99": 8.3},
+      "etcd": {"ops": 11000, "p50": 1.6, "p99": 6.2}
+    }
+  ],
+  "methodology": {
+    "fsync": "O_DIRECT on raftkv, default on etcd",
+    "connections": 64,
+    "duration": "30s per config, 3 runs averaged",
+    "unfair": "etcd uses mmap; raftkv uses O_DIRECT — etcd has page-cache advantage for small values"
+  }
+}

@@ -1,0 +1,11 @@
+{"t":100,"node":1,"term":1,"role":"follower","event":"timeout","detail":{"reason":"election timeout fired"}}
+{"t":120,"node":1,"term":2,"role":"candidate","event":"became_candidate","detail":{}}
+{"t":130,"node":1,"term":2,"role":"candidate","event":"vote_granted","from":1,"detail":{}}
+{"t":150,"node":1,"term":2,"role":"candidate","event":"vote_granted","from":2,"detail":{}}
+{"t":160,"node":3,"term":1,"role":"follower","event":"vote_denied","from":1,"detail":{"reason":"stale term"}}
+{"t":180,"node":1,"term":2,"role":"leader","event":"leader_elected","detail":{}}
+{"t":200,"node":1,"term":2,"role":"leader","event":"append_entries","to":2,"detail":{"entries":1,"prevLogIndex":0}}
+{"t":220,"node":2,"term":2,"role":"follower","event":"append_entries_ok","from":1,"detail":{"matchIndex":1}}
+{"t":230,"node":1,"term":2,"role":"leader","event":"append_entries","to":3,"detail":{"entries":1,"prevLogIndex":0}}
+{"t":250,"node":3,"term":2,"role":"follower","event":"append_entries_ok","from":1,"detail":{"matchIndex":1}}
+{"t":260,"node":1,"term":2,"role":"leader","event":"commit_advancing","detail":{"commitIndex":1}}
