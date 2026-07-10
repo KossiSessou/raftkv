@@ -113,17 +113,24 @@ func Open(dir string, cfg Config) (*WAL, error) {
 		return nil, err
 	}
 
+	// Recovery validates only the active segment: rotate() syncs a segment
+	// before creating its successor, so sealed segments cannot have torn
+	// tails. Sealed-segment corruption is detected by full replays (the KV
+	// layer's index rebuild), not here.
 	it, err := w.Replay(Offset{SegmentID: w.activeID, Position: 0})
 
 	if err != nil {
+		_ = fi.Close()
 		return nil, err
 	}
 
 	for it.Next() {
 
 	}
+	_ = it.Close()
 
 	if err := it.Err(); err != nil {
+		_ = fi.Close()
 		return nil, err
 	}
 
@@ -133,6 +140,7 @@ func Open(dir string, cfg Config) (*WAL, error) {
 	w.position = boundary
 
 	if err := w.fd.Truncate(int64(boundary)); err != nil {
+		_ = fi.Close()
 		return nil, err
 	}
 
@@ -214,6 +222,9 @@ func (w *WAL) syncLoop(ticker *time.Ticker) {
 }
 
 func (w *WAL) rotate() (err error) {
+	// Sync BEFORE creating the next segment: the existence of segment N+1 is
+	// what lets Open trust that segment N is complete, so recovery replays
+	// only the active segment. Reordering these two steps breaks recovery.
 	if err = w.fd.Sync(); err != nil {
 		_ = w.closeLocked()
 		return err

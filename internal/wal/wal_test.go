@@ -3,6 +3,7 @@ package wal
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
 	"io"
 	"os"
@@ -361,7 +362,7 @@ func TestReplayRoundTrip(t *testing.T) {
 	wantOffset := []Offset{off1, off2, off3}
 
 	if len(wantRecord) != len(records) {
-		t.Errorf("record count: want %d; got %d", len(wantRecord), len(records))
+		t.Fatalf("record count: want %d; got %d", len(wantRecord), len(records))
 	}
 
 	for i := range wantRecord {
@@ -385,8 +386,8 @@ func TestReplayRoundTrip(t *testing.T) {
 	}
 
 	want := Offset{Position: uint64(info.Size()), SegmentID: 1}
-	if it.lastValid != want {
-		t.Errorf("Last valid offset mismatch: want %+v, got %+v", want, it.lastValid)
+	if it.LastValid() != want {
+		t.Errorf("Last valid offset mismatch: want %+v, got %+v", want, it.LastValid())
 	}
 
 	// - `Close()` nil, and a second`Close()` also nil
@@ -427,8 +428,424 @@ func TestReplayEmptyWAL(t *testing.T) {
 	}
 	want := Offset{SegmentID: 1, Position: 0}
 	if it.LastValid() != want {
-		t.Errorf("Last valid offset mismatch: want %v, got %v", want, it.lastValid)
+		t.Errorf("Last valid offset mismatch: want %v, got %v", want, it.LastValid())
 	}
+
+	if err := it.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReplayMultiSegment(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := Open(dir, Config{Mode: SyncNever, MaxSize: 40})
+
+	// each record: 8 header + 10 payload = 18 bytes. Two fit in 40; third forces rotation.
+	o1, _ := w.Append([]byte("abcdefghij")) // seg 1, pos 0
+	o2, _ := w.Append([]byte("klmnopqrst")) // seg 1, pos 18
+	o3, _ := w.Append([]byte("uvwxyz7890")) // 18+18+18=54 > 40 → rotate → seg 2, pos 0
+
+	it, err := w.Replay(Offset{SegmentID: 1, Position: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, offsets, err := drainReplay(t, it)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOffset := []Offset{o1, o2, o3}
+
+	if len(wantOffset) != len(offsets) {
+		t.Fatalf("record count: want %d; got %d", len(wantOffset), len(offsets))
+	}
+
+	for i := range wantOffset {
+		if wantOffset[i] != offsets[i] {
+			t.Errorf("offset %d mismatch: want %q; got %q", i, wantOffset[i], offsets[i])
+		}
+	}
+
+	if err := it.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := Offset{SegmentID: 2, Position: 18}
+	if it.LastValid() != want {
+		t.Errorf("Last valid offset mismatch: want %v, got %v", want, it.LastValid())
+
+	}
+
+	if err := it.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+}
+
+func TestReplayFromOffset(t *testing.T) {
+	dir := t.TempDir()
+
+	w, err := Open(dir, Config{Mode: SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = w.Append([]byte("alpha"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	off2, err := w.Append([]byte("beta"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = w.Append([]byte("gamma"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	it, err := w.Replay(off2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	records, offsets, err := drainReplay(t, it)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(records) != 2 {
+		t.Fatalf("record count: want %d; got %d", 2, len(records))
+	}
+
+	if string(records[0]) != "beta" || string(records[1]) != "gamma" {
+		t.Errorf("records mismatch: want [beta gamma]; got [%s %s]", records[0], records[1])
+	}
+
+	if offsets[0] != off2 {
+		t.Errorf("offset 0 mismatch: want %q; got %q", off2, offsets[0])
+	}
+
+	if err := it.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReplayTornTail(t *testing.T) {
+
+	t.Run("mid segment", func(t *testing.T) {
+		// cut=22 leaves record 2's full header + partial payload (torn payload);
+		// cut=16 leaves record 2 fewer than 8 header bytes (torn header).
+		for _, cut := range []int64{22, 16} {
+			dir := t.TempDir()
+			w, err := Open(dir, Config{Mode: SyncAlways})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = w.Append([]byte("abcde"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = w.Append([]byte("fghij"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			// reopen BEFORE tearing the tail: Open's own recovery would repair
+			// the file first, so the damage is done behind the live WAL's back
+			// and the iterator — not Open — is what encounters the torn record.
+			w2, err := Open(dir, Config{Mode: SyncAlways})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			path := filepath.Join(dir, formatSegmentName(1))
+			if err := os.Truncate(path, cut); err != nil {
+				t.Fatal(err)
+			}
+
+			it, err := w2.Replay(Offset{1, 0})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			records, _, err := drainReplay(t, it)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(records) != 1 {
+				t.Fatalf("cut=%d: record count: want 1; got %d", cut, len(records))
+			}
+
+			if string(records[0]) != "abcde" {
+				t.Errorf("cut=%d: record 0: want %q; got %q", cut, "abcde", records[0])
+			}
+
+			// torn tail is normal recovery, not failure — WAL-4's soul.
+			if err := it.Err(); err != nil {
+				t.Errorf("cut=%d: torn tail should not be an error, got %v", cut, err)
+			}
+
+			// recovery reports the end of the last good record.
+			if got := it.LastValid(); got != (Offset{SegmentID: 1, Position: 13}) {
+				t.Errorf("cut=%d: LastValid: want {1, 13}; got %v", cut, got)
+			}
+
+			if err := it.Close(); err != nil {
+				t.Fatal(err)
+			}
+			_ = w2.Close()
+		}
+	})
+
+	t.Run("first record of fresh segment", func(t *testing.T) {
+		dir := t.TempDir()
+		w, _ := Open(dir, Config{Mode: SyncNever, MaxSize: 40})
+
+		// each record: 8 header + 10 payload = 18 bytes. Two fit in 40; third forces rotation.
+		_, _ = w.Append([]byte("abcdefghij")) // seg 1, pos 0
+		_, _ = w.Append([]byte("klmnopqrst")) // seg 1, pos 18
+		_, _ = w.Append([]byte("uvwxyz7890")) // 18+18+18=54 > 40 → rotate → seg 2, pos 0
+
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// reopen BEFORE tearing the tail — see "mid segment" for why.
+		w2, err := Open(dir, Config{Mode: SyncAlways})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		path := filepath.Join(dir, formatSegmentName(2))
+		if err := os.Truncate(path, 3); err != nil {
+			t.Fatal(err)
+		}
+
+		it, err := w2.Replay(Offset{1, 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		records, _, err := drainReplay(t, it)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(records) != 2 {
+			t.Fatalf("record count: want 2; got %d", len(records))
+		}
+
+		if string(records[0]) != "abcdefghij" {
+			t.Errorf("record 0: want %q; got %q", "abcdefghij", records[0])
+		}
+
+		// torn tail is normal recovery, not failure — WAL-4's soul.
+		if err := it.Err(); err != nil {
+			t.Errorf("torn tail should not be an error, got %v", err)
+		}
+
+		// the boundary is the start of the bad record — {2, 0}, not the end of
+		// the last good read in segment 1. The stale-boundary regression.
+		if got := it.LastValid(); got != (Offset{SegmentID: 2, Position: 0}) {
+			t.Errorf("LastValid: want {2, 0}; got %v", got)
+		}
+
+		if err := it.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		_ = w2.Close()
+
+	})
+
+}
+
+// Open must truncate a torn tail so the log is append-able again (WAL-4).
+func TestOpenTruncatesTornTail(t *testing.T) {
+	dir := t.TempDir()
+
+	w, err := Open(dir, Config{Mode: SyncAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = w.Append([]byte("abcde"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = w.Append([]byte("fghij"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, formatSegmentName(1))
+	if err := os.Truncate(path, 22); err != nil {
+		t.Fatal(err)
+	}
+
+	w2, err := Open(dir, Config{Mode: SyncAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 13 {
+		t.Errorf("Open should truncate the torn tail: size = %d; want 13", info.Size())
+	}
+
+	off, err := w2.Append([]byte("delta"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off != (Offset{SegmentID: 1, Position: 13}) {
+		t.Errorf("append after recovery at %+v; want {1, 13}", off)
+	}
+
+	it, err := w2.Replay(Offset{SegmentID: 1, Position: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	records, _, err := drainReplay(t, it)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"abcde", "delta"}
+	if len(records) != len(want) {
+		t.Fatalf("record count: want %d; got %d", len(want), len(records))
+	}
+	for i := range want {
+		if string(records[i]) != want[i] {
+			t.Errorf("record %d: want %q; got %q", i, want[i], records[i])
+		}
+	}
+
+	if err := it.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = w2.Close()
+}
+
+func TestReplaySealedCorruption(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := Open(dir, Config{Mode: SyncAlways, MaxSize: 40})
+
+	// each record: 8 header + 10 payload = 18 bytes. Two fit in 40; third forces rotation.
+	_, _ = w.Append([]byte("abcdefghij")) // seg 1, pos 0
+	_, _ = w.Append([]byte("klmnopqrst")) // seg 1, pos 18
+	_, _ = w.Append([]byte("uvwxyz7890")) // 18+18+18=54 > 40 → rotate → seg 2, pos 0
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, formatSegmentName(1))
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], 10); err != nil {
+		t.Fatal(err)
+	}
+	b[0] = ^b[0]
+	if _, err := f.WriteAt(b[:], 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w2, err := Open(dir, Config{Mode: SyncAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	it, err := w2.Replay(Offset{1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	records, _, err := drainReplay(t, it)
+
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("want ErrCorrupt; got %v", err)
+	}
+
+	if len(records) != 0 {
+		t.Fatalf("record count: want 0; got %d", len(records))
+	}
+
+	if err := it.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+}
+
+func TestIteratorCloseEarly(t *testing.T) {
+	dir := t.TempDir()
+
+	w, err := Open(dir, Config{Mode: SyncNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = w.Append([]byte("alpha"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = w.Append([]byte("beta"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = w.Append([]byte("gamma"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	it, err := w.Replay(Offset{1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !it.Next() {
+		t.Fatal("Next() = false on a log with records")
+	}
+
+	// first Close does the real work — the nil-before-close regression
+	if err := it.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// second Close is the idempotency check
+	if err := it.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if it.Next() {
+		t.Errorf("it.Next() expected to be false; got true")
+	}
+
 }
 
 // makeRecord builds a framed record (length + crc + payload) the same way

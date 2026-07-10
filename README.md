@@ -2,9 +2,7 @@
 
 A sharded, Raft-replicated, linearizable key-value database, built in Go.
 
-
-
-> **Status:** early and active. The foundational pieces below are implemented and tested under the race detector in CI. The persistent storage engine is the next milestone.
+> **Status:** Phase 0 (Foundations) is complete. The concurrent in-memory KV store and crash-safe write-ahead log below are implemented and tested under the race detector in CI. The persistent storage engine is the next milestone.
 
 ## What's implemented
 
@@ -20,8 +18,11 @@ Both are exercised by table-driven correctness tests and a benchmark matrix that
 
 ### Write-ahead log (`wal/`)
 
-An append-only, crash-safe log that durably records records before they're
-applied. Each record is framed with a fixed 8-byte header:
+An append-only, crash-safe log that durably records operations before they're
+applied to the state machine. Written entirely from scratch with no external
+dependencies.
+
+**Record format.** Each record is framed with a fixed 8-byte header:
 
 | Field    | Width   | Description                              |
 |----------|---------|------------------------------------------|
@@ -29,26 +30,46 @@ applied. Each record is framed with a fixed 8-byte header:
 | Checksum | 4 bytes | CRC32 over the length + payload          |
 | Payload  | N bytes | Caller-supplied record bytes             |
 
-Durability is configurable via the sync policy:
+**Sync policies.** Configurable durability tradeoffs:
 
 - **`SyncAlways`:** `fsync` after every append (safest, slowest).
 - **`SyncNever`:**  rely on the OS page cache (fastest, least durable).
 - **`SyncInterval`:** a background goroutine flushes on a fixed interval, trading
   a bounded window of un-synced writes for throughput.
 
-The full on-disk format and the rationale behind each field is documented in [`docs/wal-format.md`](docs/wal-format.md).
+**Segments.** The log is split into numbered segments (e.g. `0000000001.wal`).
+When the active segment reaches a configurable max size, the WAL atomically
+rotates to a new segment. Naming, parsing, and directory listing are handled by
+a dedicated `segment` module.
+
+**Crash recovery.** `Open` inspects the active segment on startup and
+transparently truncates a torn tail — partial writes left by a crash — so the
+log resumes at the last valid offset. Sealed-segment corruption is treated as a
+hard error (not expected under normal operation).
+
+**Offset-based replay.** An `Offset` type locates any record by `(segment,
+position)`. The `Replay(from Offset)` method returns an `Iterator` that yields
+records sequentially, enabling incremental reconstruction of state after an
+interruption.
+
+The on-disk format and design rationale are documented in
+[`docs/wal-format.md`](docs/wal-format.md) and
+[`docs/wal-design.md`](docs/wal-design.md).
 
 ## Project layout
 
 ```
 .
 ├── cmd/
-│   └── raftkv/       # main entry point (placeholder for now)
+│   └── raftkv/        # main entry point (placeholder)
 ├── internal/
-│   ├── kv/           # Store interface + MutexStore / ShardedStore
-│   └── wal/          # write-ahead log package
-├── docs/             # design + format documentation
-└── requirements/     # phase-by-phase specifications driving the build
+│   ├── kv/            # Store interface + MutexStore / ShardedStore
+│   └── wal/           # write-ahead log + segment utilities
+├── docs/
+│   ├── wal-design.md  # WAL runtime behaviour and concurrency contract
+│   ├── wal-format.md  # on-disk binary format specification
+│   └── LIMITATIONS.md # known limitations and design tradeoffs
+└── Makefile
 ```
 
 ## Building and testing
